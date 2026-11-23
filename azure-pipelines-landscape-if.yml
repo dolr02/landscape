@@ -1,0 +1,97 @@
+trigger: none
+pr: none
+
+parameters:
+- name: runWhatIf
+  displayName: Run Azure what-if
+  type: boolean
+  default: false
+- name: serviceConnection
+  type: string
+  default: azure-landscape-if-sc
+- name: resourceGroup
+  type: string
+  default: rg-network-landscape-lab
+- name: location
+  type: string
+  default: eastus
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+- stage: BuildAndLint
+  displayName: Build and lint the landscape
+  jobs:
+  - job: Compile
+    steps:
+    - bash: |
+        set -euo pipefail
+        mkdir -p "$BUILD_ARTIFACTSTAGINGDIRECTORY/arm"
+        az bicep build --file landscape.bicep --outfile "$BUILD_ARTIFACTSTAGINGDIRECTORY/arm/landscape.json"
+        az bicep lint --file landscape.bicep
+      displayName: Validate the complete Bicep entry point
+    - publish: $(Build.ArtifactStagingDirectory)/arm
+      artifact: landscape-arm
+
+- ${{ if eq(parameters.runWhatIf, true) }}:
+  - stage: WhatIf
+    displayName: Preview the landscape in Azure
+    dependsOn: BuildAndLint
+    condition: succeeded()
+    jobs:
+    - job: Preview
+      steps:
+      - checkout: none
+      - download: current
+        artifact: landscape-arm
+      - task: AzureCLI@2
+        displayName: Azure what-if
+        inputs:
+          azureSubscription: ${{ parameters.serviceConnection }}
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            for name in P2S_ROOT_CERT_DATA F5_ADMIN_PASSWORD BACKEND_ADMIN_PASSWORD; do
+              value=${!name:-}
+              if [[ -z "$value" || "$value" == '$('*')' ]]; then
+                printf 'Missing pipeline variable for %s\n' "$name" >&2
+                exit 1
+              fi
+            done
+
+            parameterFile=$(mktemp)
+            trap 'rm -f "$parameterFile"' EXIT
+            python3 - "$parameterFile" <<'PY'
+            import json
+            import os
+            import sys
+
+            values = {
+                'location': os.environ['LANDSCAPE_LOCATION'],
+                'p2sRootCertData': os.environ['P2S_ROOT_CERT_DATA'],
+                'f5AdminPassword': os.environ['F5_ADMIN_PASSWORD'],
+                'backendAdminPassword': os.environ['BACKEND_ADMIN_PASSWORD'],
+            }
+            parameters = {
+                '$schema': 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#',
+                'contentVersion': '1.0.0.0',
+                'parameters': {key: {'value': value} for key, value in values.items()},
+            }
+            with open(sys.argv[1], 'w', encoding='utf-8') as output:
+                json.dump(parameters, output)
+            PY
+
+            az deployment group what-if \
+              --resource-group "$TARGET_RESOURCE_GROUP" \
+              --name "landscape-if-$BUILD_BUILDID" \
+              --template-file "$PIPELINE_WORKSPACE/landscape-arm/landscape.json" \
+              --parameters "@$parameterFile" \
+              --mode Incremental
+        env:
+          TARGET_RESOURCE_GROUP: ${{ parameters.resourceGroup }}
+          LANDSCAPE_LOCATION: ${{ parameters.location }}
+          P2S_ROOT_CERT_DATA: $(p2sRootCertData)
+          F5_ADMIN_PASSWORD: $(f5AdminPassword)
+          BACKEND_ADMIN_PASSWORD: $(backendAdminPassword)
